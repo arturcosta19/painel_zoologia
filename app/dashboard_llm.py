@@ -12,7 +12,9 @@ from pathlib import Path
 import pydeck as pdk
 import re
 import xml.etree.ElementTree as ET
-from openai import OpenAI
+import requests
+from collections import Counter, defaultdict
+import math
 import json
 import hashlib
 import time
@@ -293,6 +295,267 @@ def parse_kml_points(kml_path: Path) -> pd.DataFrame:
         rows.append({"N tombo coleção": tombo, "lat": lat, "lon": lon})
 
     return pd.DataFrame(rows).drop_duplicates(subset=["N tombo coleção"])
+## FUNÇÕES LLM ------------------
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+
+def _ollama_is_up() -> bool:
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=2.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _ollama_chat(model: str, messages: list[dict], temperature: float = 0.2) -> str:
+    """
+    Tenta usar /api/chat. Se não existir (404), cai para /api/generate.
+    Assim funciona em versões/instalações do Ollama que não suportam /api/chat.
+    """
+    temperature = float(temperature)
+
+    # --------
+    # 1) Tenta /api/chat
+    # --------
+    try:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=180)
+
+        if r.status_code == 404:
+            raise RuntimeError("Ollama sem endpoint /api/chat (404)")
+
+        r.raise_for_status()
+        data = r.json()
+        content = (data.get("message") or {}).get("content", "")
+        content = (content or "").strip()
+        if content:
+            return content
+
+        # fallback se veio num formato inesperado
+        return str(data)
+
+    except Exception:
+        # --------
+        # 2) Fallback: /api/generate
+        # --------
+        # Converte messages -> um prompt único
+        # (mantém o comportamento "chat", mas usando generate)
+        system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
+        user_parts = [m["content"] for m in messages if m.get("role") == "user" and m.get("content")]
+        assistant_parts = [m["content"] for m in messages if m.get("role") == "assistant" and m.get("content")]
+
+        system_text = "\n".join(system_parts).strip()
+        convo_text = ""
+        for m in messages:
+            role = m.get("role", "")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "system":
+                continue
+            if role == "user":
+                convo_text += f"\nUSUÁRIO:\n{content}\n"
+            elif role == "assistant":
+                convo_text += f"\nASSISTENTE:\n{content}\n"
+            else:
+                convo_text += f"\n{role.upper()}:\n{content}\n"
+
+        prompt = ""
+        if system_text:
+            prompt += f"SISTEMA:\n{system_text}\n"
+        prompt += convo_text.strip()
+        prompt += "\n\nASSISTENTE:\n"
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        r = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+        resp = (data.get("response") or "").strip()
+        return resp if resp else str(data)
+
+def _tokenize(text: str) -> list[str]:
+    text = (text or "").lower()
+    return re.findall(r"[a-zà-ú0-9]+", text)
+
+def _should_use_rag(question: str) -> bool:
+    q = (question or "").strip().lower()
+
+    # muito curto: geralmente é conversa
+    if len(q) <= 4:
+        return False
+
+    # saudações / small talk comuns
+    small_talk = {
+        "oi", "olá", "ola", "eai", "e aí", "bom dia", "boa tarde", "boa noite",
+        "tudo bem", "td bem", "blz", "beleza", "valeu", "obrigado", "obrigada"
+    }
+    if q in small_talk:
+        return False
+
+    return True
+
+def _row_to_doc(row: dict) -> str:
+    keys = ["N tombo coleção", "Nome cientifico", "Nome comum", "Municipio", "Familia","Ordem", "Data entrada"]
+    parts = []
+    for k in keys:
+        v = row.get(k)
+        if v is None or pd.isna(v):
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        parts.append(f"{k}: {s}")
+    return " | ".join(parts)
+
+
+@st.cache_resource(show_spinner=False)
+def build_bm25_index(docs: list[str]):
+    doc_tokens = []
+    df = Counter()
+    lengths = []
+
+    for d in docs:
+        toks = _tokenize(d)
+        doc_tokens.append(toks)
+        lengths.append(len(toks))
+        for t in set(toks):
+            df[t] += 1
+
+    avgdl = (sum(lengths) / len(lengths)) if lengths else 0.0
+    return {
+        "docs": docs,
+        "doc_tokens": doc_tokens,
+        "df": df,
+        "avgdl": avgdl,
+        "N": len(docs),
+    }
+
+def bm25_search(index, query: str, top_k: int = 4, k1: float = 1.5, b: float = 0.75):
+    q_tokens = _tokenize(query)
+    if not q_tokens or index["N"] == 0:
+        return []
+
+    scores = []
+    N = index["N"]
+    avgdl = index["avgdl"] or 1.0
+    df = index["df"]
+    docs = index["docs"]
+    doc_tokens = index["doc_tokens"]
+
+    q_counts = Counter(q_tokens)
+
+    for i, toks in enumerate(doc_tokens):
+        if not toks:
+            continue
+        dl = len(toks)
+        tf = Counter(toks)
+        score = 0.0
+
+        for term, qf in q_counts.items():
+            n_q = df.get(term, 0)
+            if n_q == 0:
+                continue
+            idf = math.log(1 + (N - n_q + 0.5) / (n_q + 0.5))
+            f = tf.get(term, 0)
+            if f == 0:
+                continue
+            denom = f + k1 * (1 - b + b * (dl / avgdl))
+            score += idf * (f * (k1 + 1) / denom)
+
+        if score > 0:
+            scores.append((score, docs[i]))
+
+    scores.sort(reverse=True, key=lambda x: x[0])
+    return scores[:top_k]
+
+def build_corpus_from_dataframes(dfs_full: pd.DataFrame, df_kml: pd.DataFrame) -> list[str]:
+    docs = []
+
+    if isinstance(dfs_full, pd.DataFrame) and not dfs_full.empty:
+        max_rows = min(len(dfs_full), 5000)
+        df_use = dfs_full.head(max_rows)
+        for _, r in df_use.iterrows():
+            docs.append(_row_to_doc(r.to_dict()))
+
+    if isinstance(df_kml, pd.DataFrame) and not df_kml.empty:
+        for _, r in df_kml.iterrows():
+            docs.append(
+                f"KML | N tombo coleção: {r.get('N tombo coleção')} | lat: {r.get('lat')} | lon: {r.get('lon')}"
+            )
+
+    return docs
+
+
+def answer_with_local_rag(question: str, model: str, index, max_context_docs: int = 4) -> str:
+    # 1) Gate: small talk não usa RAG
+    if not _should_use_rag(question):
+        return _ollama_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Você é um assistente cordial. Responda em português, curto e direto."},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.2,
+        )
+
+    # 2) Recupera com score
+    scored = bm25_search(index, question, top_k=max_context_docs)
+
+    # 3) Limiar mínimo (evita “oi” virar espécie aleatória)
+    #    Ajuste fino: se tiver muitos falsos positivos, sobe para 2.0 / 3.0
+    MIN_SCORE = 1.2
+    kept = [(s, d) for (s, d) in scored if s >= MIN_SCORE]
+
+    # se nada relevante, responde SEM inventar
+    if not kept:
+        return _ollama_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Você é um assistente do Painel. Se não tiver dados suficientes, diga isso e sugira o que perguntar."},
+                {"role": "user", "content": f"Pergunta: {question}\n\nContexto: (nenhum trecho relevante encontrado)"},
+            ],
+            temperature=0.2,
+        )
+
+    # 4) Contexto curto e limitado
+    retrieved_docs = []
+    for s, d in kept:
+        d = d.strip()
+        if len(d) > 600:
+            d = d[:600] + "..."
+        retrieved_docs.append(f"[score={s:.2f}] {d}")
+
+    context = "\n".join([f"- {d}" for d in retrieved_docs])
+    if len(context) > 4000:
+        context = context[:4000] + "\n...(contexto cortado)"
+
+    system = (
+        "Você é um assistente do Painel de Coleção de Zoologia. "
+        "Responda em português, curto e objetivo. "
+        "Use SOMENTE o contexto fornecido. "
+        "Se a pergunta for geral demais, peça um 'N tombo coleção' ou um filtro (Município, Classe, etc.)."
+    )
+
+    user = f"Pergunta: {question}\n\nContexto (trechos recuperados do XLSX/KML):\n{context}"
+
+    return _ollama_chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+#-------------------
 
 # -----------------------------------------
 # APP
@@ -683,4 +946,71 @@ else:
     )
 
 st.subheader("Assistente (pergunte sobre os arquivos)")
+if st.button("Inicializar assistente (warmup)"):
+    _ollama_chat(DEFAULT_OLLAMA_MODEL, [{"role":"user","content":"responda apenas: ok"}], temperature=0.0)
+    st.success("Assistente pronto.")
+
+# UI / Config
+c1, c2, c3 = st.columns([2, 1, 1])
+with c1:
+    model_name = st.text_input("Modelo Ollama", value=DEFAULT_OLLAMA_MODEL, help="Ex: llama3.2, mistral, phi3, etc.")
+with c2:
+    topk = st.number_input("Top-K trechos", min_value=3, max_value=20, value=8, step=1)
+with c3:
+    temp = st.slider("Temperatura", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
+
+ollama_ok = _ollama_is_up()
+if not ollama_ok:
+    st.warning(
+        "Ollama não parece estar rodando. "
+        "Instale o Ollama e abra o app, ou inicie o serviço, e tente novamente.\n\n"
+        f"Host atual: {OLLAMA_HOST}"
+    )
+
+# Cria o corpus e o índice (cacheado)
+# Use o DFS completo (antes do filtro) pra responder perguntas gerais,
+# e df_kml para coordenadas.
+corpus_docs = build_corpus_from_dataframes(dfs, df_kml)
+index = build_bm25_index(corpus_docs)
+
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {"role": "assistant", "content": "Me pergunte algo sobre a coleção (dados e coordenadas). Ex: 'quantos por município?' ou 'onde foi coletado o tombo X?'"}
+    ]
+
+for m in st.session_state.chat_messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+prompt = st.chat_input("Pergunte algo...")
+
+if prompt:
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        if not ollama_ok:
+            st.error("Sem Ollama rodando, não consigo chamar o modelo local.")
+            answer = "Ollama não está disponível."
+        else:
+            with st.spinner("Pensando (local)..."):
+                try:
+                    # (opcional) dica de schema
+                    schema_hint = ""
+                    if isinstance(dfs, pd.DataFrame) and not dfs.empty:
+                        cols = ", ".join(list(dfs.columns)[:50])
+                        schema_hint = f"\n\nColunas disponíveis: {cols}"
+                    answer = answer_with_local_rag(
+                        question=prompt + schema_hint,
+                        model=model_name.strip() or DEFAULT_OLLAMA_MODEL,
+                        index=index,
+                        max_context_docs=int(topk),
+                    )
+                except Exception as e:
+                    answer = f"Erro ao consultar o Ollama/local RAG: {e}"
+
+        st.markdown(answer)
+
+    st.session_state.chat_messages.append({"role": "assistant", "content": answer})
 
